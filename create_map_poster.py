@@ -1,5 +1,3 @@
-from matplotlib.figure import Figure
-from networkx import MultiDiGraph
 import osmnx as ox
 import matplotlib.pyplot as plt
 from matplotlib.font_manager import FontProperties
@@ -10,53 +8,464 @@ from tqdm import tqdm
 import time
 import json
 import os
-import sys
 from datetime import datetime
 import argparse
-import asyncio
-from pathlib import Path
-from hashlib import md5
-from typing import cast
-from geopandas import GeoDataFrame
-import pickle
-
-class CacheError(Exception):
-    """Raised when a cache operation fails."""
-    pass
-
-CACHE_DIR_PATH = os.environ.get("CACHE_DIR", "cache")
-CACHE_DIR = Path(CACHE_DIR_PATH)
-
-CACHE_DIR.mkdir(exist_ok=True)
-
-def cache_file(key: str) -> str:
-    encoded = md5(key.encode()).hexdigest()
-    return f"{encoded}.pkl"
-
-def cache_get(name: str) -> dict | None:
-    path = CACHE_DIR / cache_file(name)
-    if path.exists():
-        with path.open("rb") as f:
-            return pickle.load(f)
-    return None
-
-def cache_set(name: str, obj) -> None:
-    path = CACHE_DIR / cache_file(name)
-    try:
-        with path.open("wb") as f:
-            pickle.dump(obj, f)
-    except pickle.PickleError as e:
-        raise CacheError(
-            f"Serialization error while saving cache for '{name}': {e}"
-        ) from e
-    except (OSError, IOError) as e:
-        raise CacheError(
-            f"File error while saving cache for '{name}': {e}"
-        ) from e
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 THEMES_DIR = "themes"
 FONTS_DIR = "fonts"
 POSTERS_DIR = "posters"
+
+# ============================================================================
+# Data Models
+# ============================================================================
+
+@dataclass
+class AddressHighlight:
+    """Represents a highlighted address on the map."""
+    
+    address: str                    # Full street address
+    lat: float                      # Latitude
+    lon: float                      # Longitude
+    x: float                        # Map x coordinate
+    y: float                        # Map y coordinate
+    marker_style: str = 'circle'    # 'circle', 'pin', or 'star'
+    fill_color: str = '#FF4444'     # Marker fill color
+    outline_color: str = '#FFFFFF'  # Marker outline color
+    annotation: Optional[str] = None  # Custom text
+
+# ============================================================================
+# Address Geocoding Module
+# ============================================================================
+
+class GeocodingError(Exception):
+    """Raised when address cannot be geocoded."""
+    
+    def __init__(self, address: str, suggestion: str):
+        self.address = address
+        self.suggestion = suggestion
+        super().__init__(
+            f"Could not geocode address: '{address}'\n"
+            f"Suggestion: {suggestion}"
+        )
+
+class AddressOutOfBoundsError(Exception):
+    """Raised when address is outside map boundary."""
+    
+    def __init__(self, address: str, distance: float, required_distance: float):
+        self.address = address
+        self.distance = distance
+        self.required_distance = required_distance
+        super().__init__(
+            f"Address '{address}' is {distance:.0f}m from map center.\n"
+            f"Try increasing --distance to at least {required_distance:.0f}m"
+        )
+
+def geocode_address(address: str, city: str, country: str) -> tuple:
+    """
+    Geocode a street address to latitude/longitude coordinates.
+    
+    Args:
+        address: Full street address (e.g., "300 E Pike St, Seattle, WA 98122")
+        city: City name for context
+        country: Country name for context
+    
+    Returns:
+        Tuple of (latitude, longitude)
+    
+    Raises:
+        GeocodingError: If address cannot be geocoded
+        ConnectionError: If geocoding service is unavailable
+    """
+    geolocator = Nominatim(user_agent="city_map_poster")
+    
+    # Construct full query string for better accuracy
+    full_query = f"{address}, {city}, {country}"
+    
+    # Implement exponential backoff for rate limiting
+    max_retries = 4
+    retry_delays = [1, 2, 4, 8]  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            # Add rate limiting delay
+            if attempt > 0:
+                print(f"Retrying geocoding (attempt {attempt + 1}/{max_retries})...")
+            time.sleep(retry_delays[attempt] if attempt < len(retry_delays) else 8)
+            
+            location = geolocator.geocode(full_query, timeout=10)
+            
+            if location:
+                print(f"✓ Geocoded address: {location.address}")
+                print(f"✓ Coordinates: {location.latitude}, {location.longitude}")
+                return (location.latitude, location.longitude)
+            else:
+                # No results found
+                suggestion = (
+                    "Try providing a more complete address with street number, "
+                    "street name, city, state/province, and postal code."
+                )
+                raise GeocodingError(address, suggestion)
+                
+        except Exception as e:
+            if "timed out" in str(e).lower():
+                if attempt < max_retries - 1:
+                    continue  # Retry
+                else:
+                    raise ConnectionError(
+                        f"Geocoding service timed out after {max_retries} attempts. "
+                        "Please check your internet connection and try again."
+                    )
+            elif isinstance(e, GeocodingError):
+                raise  # Re-raise our custom error
+            else:
+                # Other errors
+                suggestion = "Check the address format and try again."
+                raise GeocodingError(address, suggestion)
+    
+    # Should not reach here, but just in case
+    raise GeocodingError(address, "Unable to geocode address after multiple attempts.")
+
+def calculate_distance_between_points(point1: tuple, point2: tuple) -> float:
+    """
+    Calculate great circle distance between two lat/lon points in meters.
+    Uses Haversine formula.
+    
+    Args:
+        point1: (lat, lon) of first point
+        point2: (lat, lon) of second point
+    
+    Returns:
+        Distance in meters
+    """
+    from math import radians, sin, cos, sqrt, atan2
+    
+    lat1, lon1 = point1
+    lat2, lon2 = point2
+    
+    # Earth's radius in meters
+    R = 6371000
+    
+    # Convert to radians
+    lat1_rad = radians(lat1)
+    lat2_rad = radians(lat2)
+    delta_lat = radians(lat2 - lat1)
+    delta_lon = radians(lon2 - lon1)
+    
+    # Haversine formula
+    a = sin(delta_lat / 2) ** 2 + cos(lat1_rad) * cos(lat2_rad) * sin(delta_lon / 2) ** 2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    distance = R * c
+    
+    return distance
+
+def validate_coordinates_in_bounds(
+    address_coords: tuple,
+    center_coords: tuple,
+    distance: int
+) -> bool:
+    """
+    Check if address coordinates fall within the map boundary.
+    
+    Args:
+        address_coords: (lat, lon) of the address
+        center_coords: (lat, lon) of the map center
+        distance: Map radius in meters
+    
+    Returns:
+        True if address is within bounds, False otherwise
+    """
+    actual_distance = calculate_distance_between_points(address_coords, center_coords)
+    return actual_distance <= distance
+
+# ============================================================================
+# Coordinate Transformation Module
+# ============================================================================
+
+def transform_latlon_to_map_coords(lat: float, lon: float, G) -> tuple:
+    """
+    Transform latitude/longitude to map x/y coordinates.
+    
+    Args:
+        lat: Latitude of the address
+        lon: Longitude of the address
+        G: OSMnx graph with CRS projection information
+    
+    Returns:
+        Tuple of (x, y) in map coordinate system
+    """
+    from pyproj import Transformer
+    
+    # Get the graph's CRS (Coordinate Reference System)
+    # OSMnx graphs typically use UTM projection
+    graph_crs = G.graph.get('crs', 'EPSG:4326')
+    
+    # Create transformer from WGS84 (EPSG:4326) to graph's CRS
+    # WGS84 is the standard lat/lon coordinate system
+    transformer = Transformer.from_crs('EPSG:4326', graph_crs, always_xy=True)
+    
+    # Transform coordinates
+    # Note: pyproj expects (lon, lat) order when always_xy=True
+    x, y = transformer.transform(lon, lat)
+    
+    return (x, y)
+
+# ============================================================================
+# Marker Color Selection Module
+# ============================================================================
+
+def calculate_luminance(hex_color: str) -> float:
+    """
+    Calculate relative luminance using WCAG formula.
+    
+    Args:
+        hex_color: Hex color string (e.g., "#FF0000" or "FF0000")
+    
+    Returns:
+        Luminance value (0.0 to 1.0)
+    """
+    # Remove '#' if present
+    hex_color = hex_color.lstrip('#')
+    
+    # Convert hex to RGB (0-255)
+    r = int(hex_color[0:2], 16)
+    g = int(hex_color[2:4], 16)
+    b = int(hex_color[4:6], 16)
+    
+    # Convert to 0-1 range
+    r = r / 255.0
+    g = g / 255.0
+    b = b / 255.0
+    
+    # Apply gamma correction (WCAG formula)
+    def gamma_correct(channel):
+        if channel <= 0.03928:
+            return channel / 12.92
+        else:
+            return ((channel + 0.055) / 1.055) ** 2.4
+    
+    r = gamma_correct(r)
+    g = gamma_correct(g)
+    b = gamma_correct(b)
+    
+    # Calculate relative luminance
+    luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    
+    return luminance
+
+def calculate_contrast_ratio(hex_color1: str, hex_color2: str) -> float:
+    """
+    Calculate WCAG contrast ratio between two colors.
+    
+    Args:
+        hex_color1: First hex color string
+        hex_color2: Second hex color string
+    
+    Returns:
+        Contrast ratio value (1.0 to 21.0)
+    """
+    lum1 = calculate_luminance(hex_color1)
+    lum2 = calculate_luminance(hex_color2)
+    
+    # Ensure lighter color is in numerator
+    lighter = max(lum1, lum2)
+    darker = min(lum1, lum2)
+    
+    # Calculate contrast ratio
+    contrast_ratio = (lighter + 0.05) / (darker + 0.05)
+    
+    return contrast_ratio
+
+def get_marker_color(theme: dict) -> tuple:
+    """
+    Determine marker colors based on theme.
+    
+    Args:
+        theme: Theme dictionary with color definitions
+    
+    Returns:
+        Tuple of (fill_color, outline_color)
+    """
+    # Check if theme explicitly defines marker colors
+    if 'marker_fill' in theme:
+        fill_color = theme['marker_fill']
+        outline_color = theme.get('marker_outline', '#FFFFFF')
+        return (fill_color, outline_color)
+    
+    # Calculate contrasting colors based on background
+    bg_color = theme.get('bg', '#FFFFFF')
+    bg_luminance = calculate_luminance(bg_color)
+    
+    # Determine if background is light or dark
+    if bg_luminance > 0.5:
+        # Light background - use darker marker colors
+        fill_color = '#FF4444'  # Red
+        outline_color = '#FFFFFF'  # White
+    else:
+        # Dark background - use lighter marker colors
+        fill_color = '#FF6666'  # Lighter red
+        outline_color = '#000000'  # Black
+    
+    # Verify contrast ratio meets minimum 4.5:1
+    contrast_fill = calculate_contrast_ratio(fill_color, bg_color)
+    contrast_outline = calculate_contrast_ratio(outline_color, bg_color)
+    
+    # If contrast is insufficient, adjust colors
+    if contrast_fill < 4.5:
+        # Try alternative colors
+        if bg_luminance > 0.5:
+            fill_color = '#CC0000'  # Darker red
+        else:
+            fill_color = '#FF8888'  # Even lighter red
+    
+    if contrast_outline < 4.5:
+        # Adjust outline color
+        if bg_luminance > 0.5:
+            outline_color = '#000000'  # Black
+        else:
+            outline_color = '#FFFFFF'  # White
+    
+    return (fill_color, outline_color)
+
+# ============================================================================
+# Marker Rendering Module
+# ============================================================================
+
+def render_circle_marker(ax, x, y, fill_color, outline_color, size):
+    """
+    Render a circular marker with outer ring.
+    
+    Args:
+        ax: Matplotlib axes object
+        x: X coordinate in map space
+        y: Y coordinate in map space
+        fill_color: Interior color of marker
+        outline_color: Border color of marker
+        size: Base marker size in points
+    """
+    # Draw outer ring at 1.5x size with outline color (50% opacity)
+    ax.scatter(x, y, s=size * 1.5, c=outline_color, alpha=0.5, zorder=15, edgecolors='none')
+    
+    # Draw inner circle at 1.0x size with fill color
+    ax.scatter(x, y, s=size, c=fill_color, alpha=1.0, zorder=15, edgecolors='none')
+    
+    # Draw center dot at 0.3x size with outline color
+    ax.scatter(x, y, s=size * 0.3, c=outline_color, alpha=1.0, zorder=15, edgecolors='none')
+
+def render_pin_marker(ax, x, y, fill_color, outline_color, size):
+    """
+    Render a map pin style marker.
+    
+    Args:
+        ax: Matplotlib axes object
+        x: X coordinate in map space
+        y: Y coordinate in map space
+        fill_color: Interior color of marker
+        outline_color: Border color of marker
+        size: Base marker size in points
+    """
+    from matplotlib.path import Path
+    import matplotlib.patches as patches
+    
+    # Calculate pin dimensions based on size
+    # Size is in points^2 for scatter, so we need to scale appropriately
+    scale = (size / 200) ** 0.5  # Normalize to base size of 200
+    
+    # Pin dimensions (teardrop shape)
+    circle_radius = 15 * scale
+    tip_length = 25 * scale
+    
+    # Create teardrop path
+    # Circle at top, pointed tip at bottom
+    theta = np.linspace(0, 2 * np.pi, 50)
+    circle_x = x + circle_radius * np.cos(theta)
+    circle_y = y + tip_length + circle_radius * np.sin(theta)
+    
+    # Create vertices for the teardrop
+    # Start with circle, then add tip point
+    vertices = list(zip(circle_x, circle_y))
+    vertices.append((x, y))  # Tip point at exact coordinates
+    
+    # Create path
+    codes = [Path.MOVETO] + [Path.LINETO] * (len(vertices) - 2) + [Path.CLOSEPOLY]
+    path = Path(vertices, codes)
+    
+    # Draw outline
+    patch_outline = patches.PathPatch(path, facecolor=outline_color, edgecolor=outline_color, 
+                                      linewidth=2, alpha=0.8, zorder=15)
+    ax.add_patch(patch_outline)
+    
+    # Draw fill (slightly smaller)
+    patch_fill = patches.PathPatch(path, facecolor=fill_color, edgecolor='none', 
+                                   alpha=1.0, zorder=15)
+    ax.add_patch(patch_fill)
+
+def render_star_marker(ax, x, y, fill_color, outline_color, size):
+    """
+    Render a star-shaped marker.
+    
+    Args:
+        ax: Matplotlib axes object
+        x: X coordinate in map space
+        y: Y coordinate in map space
+        fill_color: Interior color of marker
+        outline_color: Border color of marker
+        size: Base marker size in points
+    """
+    # Layer large outline star with smaller fill star
+    # Outer star (outline) at 1.5x size
+    ax.scatter(x, y, s=size * 1.5, marker='*', c=outline_color, alpha=0.8, zorder=15, edgecolors='none')
+    
+    # Inner star (fill) at 1.0x size
+    ax.scatter(x, y, s=size, marker='*', c=fill_color, alpha=1.0, zorder=15, edgecolors='none')
+
+def render_heart_marker(ax, x, y, fill_color, outline_color, size):
+    """
+    Render a heart-shaped marker (currently hexagon as placeholder).
+    
+    Args:
+        ax: Matplotlib axes object
+        x: X coordinate in map space
+        y: Y coordinate in map space
+        fill_color: Interior color of marker
+        outline_color: Border color of marker
+        size: Base marker size in points
+    """
+    # Using hexagon marker as placeholder for heart
+    # Outer hexagon (outline) at 1.5x size
+    ax.scatter(x, y, s=size * 1.5, marker='h', c=outline_color, alpha=0.8, zorder=15, edgecolors='none')
+    
+    # Inner hexagon (fill) at 1.0x size
+    ax.scatter(x, y, s=size, marker='h', c=fill_color, alpha=1.0, zorder=15, edgecolors='none')
+
+def render_address_marker(ax, x, y, style='circle', fill_color='#FF4444', 
+                          outline_color='#FFFFFF', size=200):
+    """
+    Render a marker at the specified map coordinates.
+    
+    Args:
+        ax: Matplotlib axes object
+        x: X coordinate in map space
+        y: Y coordinate in map space
+        style: Marker style ('circle', 'pin', 'star', 'heart')
+        fill_color: Interior color of marker
+        outline_color: Border color of marker
+        size: Marker size in points
+    """
+    # Dispatch to appropriate marker function based on style
+    if style == 'circle':
+        render_circle_marker(ax, x, y, fill_color, outline_color, size)
+    elif style == 'pin':
+        render_pin_marker(ax, x, y, fill_color, outline_color, size)
+    elif style == 'star':
+        render_star_marker(ax, x, y, fill_color, outline_color, size)
+    elif style == 'heart':
+        render_heart_marker(ax, x, y, fill_color, outline_color, size)
+    else:
+        # Invalid marker style - fallback to circle with warning
+        print(f"⚠ Warning: Invalid marker style '{style}'. Using 'circle' instead.")
+        render_circle_marker(ax, x, y, fill_color, outline_color, size)
 
 def load_fonts():
     """
@@ -79,17 +488,33 @@ def load_fonts():
 
 FONTS = load_fonts()
 
-def generate_output_filename(city, theme_name, output_format):
+def generate_output_filename(city, theme_name, highlighted=False):
     """
     Generate unique output filename with city, theme, and datetime.
+    
+    Args:
+        city: City name
+        theme_name: Theme name
+        highlighted: If True, include "highlighted" in filename
+    
+    Returns:
+        Full path to output file
     """
     if not os.path.exists(POSTERS_DIR):
         os.makedirs(POSTERS_DIR)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     city_slug = city.lower().replace(' ', '_')
-    ext = output_format.lower()
-    filename = f"{city_slug}_{theme_name}_{timestamp}.{ext}"
+    
+    # Sanitize city_slug to be filesystem-safe
+    import re
+    city_slug = re.sub(r'[^a-z0-9_-]', '', city_slug)
+    
+    if highlighted:
+        filename = f"{city_slug}_{theme_name}_highlighted_{timestamp}.png"
+    else:
+        filename = f"{city_slug}_{theme_name}_{timestamp}.png"
+    
     return os.path.join(POSTERS_DIR, filename)
 
 def get_available_themes():
@@ -139,7 +564,7 @@ def load_theme(theme_name="feature_based"):
         return theme
 
 # Load theme (can be changed via command line or input)
-THEME = dict[str, str]()  # Will be loaded later
+THEME = None  # Will be loaded later
 
 def create_gradient_fade(ax, color, location='bottom', zorder=10):
     """
@@ -242,271 +667,220 @@ def get_coordinates(city, country):
     Fetches coordinates for a given city and country using geopy.
     Includes rate limiting to be respectful to the geocoding service.
     """
-    coords = f"coords_{city.lower()}_{country.lower()}"
-    cached = cache_get(coords)
-    if cached:
-        print(f"✓ Using cached coordinates for {city}, {country}")
-        return cached
-
     print("Looking up coordinates...")
-    geolocator = Nominatim(user_agent="city_map_poster", timeout=10) # type: ignore
+    geolocator = Nominatim(user_agent="city_map_poster")
     
     # Add a small delay to respect Nominatim's usage policy
     time.sleep(1)
     
     location = geolocator.geocode(f"{city}, {country}")
     
-    # If geocode returned a coroutine in some environments, run it to get the result.
-    if asyncio.iscoroutine(location):
-        try:
-            location = asyncio.run(location)
-        except RuntimeError:
-            # If an event loop is already running, try using it to complete the coroutine.
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Running event loop in the same thread; raise a clear error.
-                raise RuntimeError("Geocoder returned a coroutine while an event loop is already running. Run this script in a synchronous environment.")
-            location = loop.run_until_complete(location)
-    
     if location:
-        # Use getattr to safely access address (helps static analyzers)
-        addr = getattr(location, "address", None)
-        if addr:
-            print(f"✓ Found: {addr}")
-        else:
-            print("✓ Found location (address not available)")
+        print(f"✓ Found: {location.address}")
         print(f"✓ Coordinates: {location.latitude}, {location.longitude}")
-        try:
-            cache_set(coords, (location.latitude, location.longitude))
-        except CacheError as e:
-            print(e)
         return (location.latitude, location.longitude)
     else:
         raise ValueError(f"Could not find coordinates for {city}, {country}")
-    
-def get_crop_limits(G: MultiDiGraph, fig: Figure) -> tuple[tuple[float, float], tuple[float, float]]:
-    """
-    Determine cropping limits to maintain aspect ratio of the figure.
 
-    This function calculates the extents of the graph's nodes and adjusts
-    the x and y limits to match the aspect ratio of the provided figure.
-    
-    :param G: The graph to be plotted
-    :type G: MultiDiGraph
-    :param fig: The matplotlib figure object
-    :type fig: Figure
-    :return: Tuple of x and y limits for cropping
-    :rtype: tuple[tuple[float, float], tuple[float, float]]
-    """
-    # Compute node extents in projected coordinates
-    xs = [data['x'] for _, data in G.nodes(data=True)]
-    ys = [data['y'] for _, data in G.nodes(data=True)]
-    minx, maxx = min(xs), max(xs)
-    miny, maxy = min(ys), max(ys)
-    x_range = maxx - minx
-    y_range = maxy - miny
-
-    fig_width, fig_height = fig.get_size_inches()
-    desired_aspect = fig_width / fig_height
-    current_aspect = x_range / y_range
-
-    center_x = (minx + maxx) / 2
-    center_y = (miny + maxy) / 2
-
-    if current_aspect > desired_aspect:
-        # Too wide, need to crop horizontally
-        desired_x_range = y_range * desired_aspect
-        new_minx = center_x - desired_x_range / 2
-        new_maxx = center_x + desired_x_range / 2
-        new_miny, new_maxy = miny, maxy
-        crop_xlim = (new_minx, new_maxx)
-        crop_ylim = (new_miny, new_maxy)
-    elif current_aspect < desired_aspect:
-        # Too tall, need to crop vertically
-        desired_y_range = x_range / desired_aspect
-        new_miny = center_y - desired_y_range / 2
-        new_maxy = center_y + desired_y_range / 2
-        new_minx, new_maxx = minx, maxx
-        crop_xlim = (new_minx, new_maxx)
-        crop_ylim = (new_miny, new_maxy)
-    else:
-        # Otherwise, keep original extents (no horizontal crop)
-        crop_xlim = (minx, maxx)
-        crop_ylim = (miny, maxy)
-    
-    return crop_xlim, crop_ylim
-
-def fetch_graph(point, dist) -> MultiDiGraph | None:
-    lat, lon = point
-    graph = f"graph_{lat}_{lon}_{dist}"
-    cached = cache_get(graph)
-    if cached is not None:
-        print("✓ Using cached street network")
-        return cast(MultiDiGraph, cached)
-
-    try:
-        G = ox.graph_from_point(point, dist=dist, dist_type='bbox', network_type='all')
-        # Rate limit between requests
-        time.sleep(0.5)
-        try:
-            cache_set(graph, G)
-        except CacheError as e:
-            print(e)
-        return G
-    except Exception as e:
-        print(f"OSMnx error while fetching graph: {e}")
-        return None
-
-def fetch_features(point, dist, tags, name) -> GeoDataFrame | None:
-    lat, lon = point
-    tag_str = "_".join(tags.keys())
-    features = f"{name}_{lat}_{lon}_{dist}_{tag_str}"
-    cached = cache_get(features)
-    if cached is not None:
-        print(f"✓ Using cached {name}")
-        return cast(GeoDataFrame, cached)
-
-    try:
-        data = ox.features_from_point(point, tags=tags, dist=dist)
-        # Rate limit between requests
-        time.sleep(0.3)
-        try:
-            cache_set(features, data)
-        except CacheError as e:
-            print(e)
-        return data
-    except Exception as e:
-        print(f"OSMnx error while fetching features: {e}")
-        return None
-
-def create_poster(city, country, point, dist, output_file, output_format):
+def create_poster(city, country, point, dist, output_file, annotation=None, address_highlight=None, date_text=None):
     print(f"\nGenerating map for {city}, {country}...")
     
     # Progress bar for data fetching
     with tqdm(total=3, desc="Fetching map data", unit="step", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
         # 1. Fetch Street Network
         pbar.set_description("Downloading street network")
-        G = fetch_graph(point, dist)
-        if G is None:
-            raise RuntimeError("Failed to retrieve street network data.")
+        G = ox.graph_from_point(point, dist=dist, dist_type='bbox', network_type='all')
         pbar.update(1)
+        time.sleep(0.5)  # Rate limit between requests
         
         # 2. Fetch Water Features
         pbar.set_description("Downloading water features")
-        water = fetch_features(point, dist, {'natural': 'water', 'waterway': 'riverbank'}, 'water')
+        try:
+            water = ox.features_from_point(point, tags={'natural': 'water', 'waterway': 'riverbank'}, dist=dist)
+        except:
+            water = None
         pbar.update(1)
+        time.sleep(0.3)
         
         # 3. Fetch Parks
         pbar.set_description("Downloading parks/green spaces")
-        parks = fetch_features(point, dist, {'leisure': 'park', 'landuse': 'grass'}, 'parks')
+        try:
+            parks = ox.features_from_point(point, tags={'leisure': 'park', 'landuse': 'grass'}, dist=dist)
+        except:
+            parks = None
         pbar.update(1)
     
-    print("✓ All data retrieved successfully!")
+    print("✓ All data downloaded successfully!")
     
     # 2. Setup Plot
     print("Rendering map...")
     fig, ax = plt.subplots(figsize=(12, 16), facecolor=THEME['bg'])
     ax.set_facecolor(THEME['bg'])
-    ax.set_position((0.0, 0.0, 1.0, 1.0))
-
-    # Project graph to a metric CRS so distances and aspect are linear (meters)
-    G_proj = ox.project_graph(G)
+    ax.set_position([0, 0, 1, 1])
     
     # 3. Plot Layers
-    # Layer 1: Polygons (filter to only plot polygon/multipolygon geometries, not points)
+    # Layer 1: Polygons
     if water is not None and not water.empty:
-        # Filter to only polygon/multipolygon geometries to avoid point features showing as dots
-        water_polys = water[water.geometry.type.isin(['Polygon', 'MultiPolygon'])]
-        if not water_polys.empty:
-            # Project water features in the same CRS as the graph
-            try:
-                water_polys = ox.projection.project_gdf(water_polys)
-            except Exception:
-                water_polys = water_polys.to_crs(G_proj.graph['crs'])
-            water_polys.plot(ax=ax, facecolor=THEME['water'], edgecolor='none', zorder=1)
-    
+        water.plot(ax=ax, facecolor=THEME['water'], edgecolor='none', zorder=1)
     if parks is not None and not parks.empty:
-        # Filter to only polygon/multipolygon geometries to avoid point features showing as dots
-        parks_polys = parks[parks.geometry.type.isin(['Polygon', 'MultiPolygon'])]
-        if not parks_polys.empty:
-            # Project park features in the same CRS as the graph
-            try:
-                parks_polys = ox.projection.project_gdf(parks_polys)
-            except Exception:
-                parks_polys = parks_polys.to_crs(G_proj.graph['crs'])
-            parks_polys.plot(ax=ax, facecolor=THEME['parks'], edgecolor='none', zorder=2)
+        parks.plot(ax=ax, facecolor=THEME['parks'], edgecolor='none', zorder=2)
     
     # Layer 2: Roads with hierarchy coloring
     print("Applying road hierarchy colors...")
-    edge_colors = get_edge_colors_by_type(G_proj)
-    edge_widths = get_edge_widths_by_type(G_proj)
-
-    # Determine cropping limits to maintain the poster aspect ratio
-    crop_xlim, crop_ylim = get_crop_limits(G_proj, fig)
-
-    # Plot the projected graph and then apply the cropped limits
+    edge_colors = get_edge_colors_by_type(G)
+    edge_widths = get_edge_widths_by_type(G)
+    
     ox.plot_graph(
-        G_proj, ax=ax, bgcolor=THEME['bg'],
+        G, ax=ax, bgcolor=THEME['bg'],
         node_size=0,
         edge_color=edge_colors,
         edge_linewidth=edge_widths,
         show=False, close=False
     )
-    ax.set_aspect('equal', adjustable='box')
-    ax.set_xlim(crop_xlim)
-    ax.set_ylim(crop_ylim)
+    
+    # Layer 2.5: Address Marker (after roads, before gradients)
+    if address_highlight is not None:
+        print("Rendering address marker...")
+        # Transform lat/lon to map coordinates
+        x, y = transform_latlon_to_map_coords(address_highlight.lat, address_highlight.lon, G)
+        
+        # Calculate marker size based on map distance
+        if dist < 8000:
+            marker_size = 300
+        elif dist < 15000:
+            marker_size = 200
+        else:
+            marker_size = 150
+        
+        # Render the marker
+        render_address_marker(
+            ax, x, y,
+            style=address_highlight.marker_style,
+            fill_color=address_highlight.fill_color,
+            outline_color=address_highlight.outline_color,
+            size=marker_size
+        )
+        print(f"✓ Address marker rendered at ({x:.2f}, {y:.2f})")
     
     # Layer 3: Gradients (Top and Bottom)
     create_gradient_fade(ax, THEME['gradient_color'], location='bottom', zorder=10)
     create_gradient_fade(ax, THEME['gradient_color'], location='top', zorder=10)
     
     # 4. Typography using Roboto font
-    if FONTS:
-        font_main = FontProperties(fname=FONTS['bold'], size=60)
-        font_top = FontProperties(fname=FONTS['bold'], size=40)
-        font_sub = FontProperties(fname=FONTS['light'], size=22)
-        font_coords = FontProperties(fname=FONTS['regular'], size=14)
+    # When address is highlighted, make annotation prominent and city smaller
+    if address_highlight is not None:
+        # Romantic/gift mode: aesthetic, clean, romantic typography
+        if FONTS:
+            # Use Roboto but with better styling for romantic aesthetic
+            font_annotation = FontProperties(fname=FONTS['light'], size=44)     # Light but large - elegant
+            font_date = FontProperties(fname=FONTS['regular'], size=20)         # Regular - clear
+            font_city = FontProperties(fname=FONTS['light'], size=13)           # Light - subtle
+            font_coords = FontProperties(fname=FONTS['light'], size=9)          # Light - minimal
+        else:
+            # Fallback to elegant serif fonts
+            font_annotation = FontProperties(family='serif', weight='light', size=44)
+            font_date = FontProperties(family='serif', weight='normal', size=20)
+            font_city = FontProperties(family='serif', weight='light', size=13)
+            font_coords = FontProperties(family='serif', weight='light', size=9)
     else:
-        # Fallback to system fonts
-        font_main = FontProperties(family='monospace', weight='bold', size=60)
-        font_top = FontProperties(family='monospace', weight='bold', size=40)
-        font_sub = FontProperties(family='monospace', weight='normal', size=22)
-        font_coords = FontProperties(family='monospace', size=14)
+        # Normal mode: city is the main text
+        if FONTS:
+            font_main = FontProperties(fname=FONTS['bold'], size=60)
+            font_top = FontProperties(fname=FONTS['bold'], size=40)
+            font_sub = FontProperties(fname=FONTS['light'], size=22)
+            font_coords = FontProperties(fname=FONTS['regular'], size=14)
+        else:
+            font_main = FontProperties(family='monospace', weight='bold', size=60)
+            font_top = FontProperties(family='monospace', weight='bold', size=40)
+            font_sub = FontProperties(family='monospace', weight='normal', size=22)
+            font_coords = FontProperties(family='monospace', size=14)
     
-    spaced_city = "  ".join(list(city.upper()))
+    # Extract annotation from address_highlight if provided, otherwise use annotation parameter
+    annotation_text = None
+    if address_highlight is not None and address_highlight.annotation:
+        annotation_text = address_highlight.annotation
+    elif annotation:
+        annotation_text = annotation
     
-    # Dynamically adjust font size based on city name length to prevent truncation
-    base_font_size = 60
-    city_char_count = len(city)
-    if city_char_count > 10:
-        # Scale down font size for longer names
-        scale_factor = 10 / city_char_count
-        adjusted_font_size = max(base_font_size * scale_factor, 24)  # Minimum size of 24
+    # --- BOTTOM TEXT LAYOUT ---
+    if address_highlight is not None and annotation_text:
+        # ROMANTIC/GIFT MODE: Vertical layout with decreasing boldness
+        
+        # Prepare annotation text
+        max_annotation_length = 100
+        if len(annotation_text) > max_annotation_length:
+            print(f"⚠ Warning: Annotation text truncated from {len(annotation_text)} to {max_annotation_length} characters.")
+            annotation_text = annotation_text[:max_annotation_length - 3] + "..."
+        
+        annotation_color = THEME.get('annotation_color', THEME['text'])
+        
+        # Annotation at y=0.145 (light but large - elegant and clean)
+        ax.text(0.5, 0.145, annotation_text, transform=ax.transAxes,
+                color=annotation_color, ha='center', fontproperties=font_annotation, 
+                alpha=0.95, zorder=11)
+        
+        # Elegant decorative line at y=0.128
+        ax.plot([0.38, 0.62], [0.128, 0.128], transform=ax.transAxes, 
+                color=THEME['text'], linewidth=0.5, alpha=0.4, zorder=11)
+        
+        # Date at y=0.108 (clean and readable)
+        if date_text:
+            ax.text(0.5, 0.108, date_text, transform=ax.transAxes,
+                    color=THEME['text'], ha='center', fontproperties=font_date, 
+                    alpha=0.80, zorder=11)
+        
+        # City name at y=0.090 (subtle but visible)
+        spaced_city = "  ".join(list(city.upper()))
+        ax.text(0.5, 0.090, spaced_city, transform=ax.transAxes,
+                color=THEME['text'], ha='center', fontproperties=font_city, 
+                alpha=0.65, zorder=11)
+        
+        # Coordinates at y=0.078 (minimal but present)
+        lat, lon = point
+        coords = f"{lat:.4f}° N / {lon:.4f}° E" if lat >= 0 else f"{abs(lat):.4f}° S / {lon:.4f}° E"
+        if lon < 0:
+            coords = coords.replace("E", "W")
+        
+        ax.text(0.5, 0.078, coords, transform=ax.transAxes,
+                color=THEME['text'], alpha=0.50, ha='center', fontproperties=font_coords, zorder=11)
+    
     else:
-        adjusted_font_size = base_font_size
-    
-    if FONTS:
-        font_main_adjusted = FontProperties(fname=FONTS['bold'], size=adjusted_font_size)
-    else:
-        font_main_adjusted = FontProperties(family='monospace', weight='bold', size=adjusted_font_size)
-
-    # --- BOTTOM TEXT ---
-    ax.text(0.5, 0.14, spaced_city, transform=ax.transAxes,
-            color=THEME['text'], ha='center', fontproperties=font_main_adjusted, zorder=11)
-    
-    ax.text(0.5, 0.10, country.upper(), transform=ax.transAxes,
-            color=THEME['text'], ha='center', fontproperties=font_sub, zorder=11)
-    
-    lat, lon = point
-    coords = f"{lat:.4f}° N / {lon:.4f}° E" if lat >= 0 else f"{abs(lat):.4f}° S / {lon:.4f}° E"
-    if lon < 0:
-        coords = coords.replace("E", "W")
-    
-    ax.text(0.5, 0.07, coords, transform=ax.transAxes,
-            color=THEME['text'], alpha=0.7, ha='center', fontproperties=font_coords, zorder=11)
-    
-    ax.plot([0.4, 0.6], [0.125, 0.125], transform=ax.transAxes, 
-            color=THEME['text'], linewidth=1, zorder=11)
+        # NORMAL MODE: City is prominent
+        spaced_city = "  ".join(list(city.upper()))
+        
+        # City name at y=0.14
+        ax.text(0.5, 0.14, spaced_city, transform=ax.transAxes,
+                color=THEME['text'], ha='center', fontproperties=font_main, zorder=11)
+        
+        # Decorative line at y=0.125
+        ax.plot([0.4, 0.6], [0.125, 0.125], transform=ax.transAxes, 
+                color=THEME['text'], linewidth=1, zorder=11)
+        
+        # Annotation text at y=0.115 (if provided)
+        if annotation_text:
+            max_annotation_length = 100
+            if len(annotation_text) > max_annotation_length:
+                print(f"⚠ Warning: Annotation text truncated from {len(annotation_text)} to {max_annotation_length} characters.")
+                annotation_text = annotation_text[:max_annotation_length - 3] + "..."
+            
+            font_annotation = FontProperties(fname=FONTS['light'], size=18) if FONTS else FontProperties(family='monospace', size=18)
+            annotation_color = THEME.get('annotation_color', THEME['text'])
+            ax.text(0.5, 0.115, annotation_text, transform=ax.transAxes,
+                    color=annotation_color, ha='center', fontproperties=font_annotation, 
+                    alpha=0.9, zorder=11)
+        
+        # Country name at y=0.10
+        ax.text(0.5, 0.10, country.upper(), transform=ax.transAxes,
+                color=THEME['text'], ha='center', fontproperties=font_sub, zorder=11)
+        
+        # Coordinates at y=0.07
+        lat, lon = point
+        coords = f"{lat:.4f}° N / {lon:.4f}° E" if lat >= 0 else f"{abs(lat):.4f}° S / {lon:.4f}° E"
+        if lon < 0:
+            coords = coords.replace("E", "W")
+        
+        ax.text(0.5, 0.07, coords, transform=ax.transAxes,
+                color=THEME['text'], alpha=0.7, ha='center', fontproperties=font_coords, zorder=11)
 
     # --- ATTRIBUTION (bottom right) ---
     if FONTS:
@@ -520,19 +894,9 @@ def create_poster(city, country, point, dist, output_file, output_format):
 
     # 5. Save
     print(f"Saving to {output_file}...")
-
-    fmt = output_format.lower()
-    save_kwargs = dict(facecolor=THEME["bg"], bbox_inches="tight", pad_inches=0.05,)
-
-    # DPI matters mainly for raster formats
-    if fmt == "png":
-        save_kwargs["dpi"] = 300
-
-    plt.savefig(output_file, format=fmt, **save_kwargs)
-
+    plt.savefig(output_file, dpi=300, facecolor=THEME['bg'])
     plt.close()
     print(f"✓ Done! Poster saved as {output_file}")
-
 
 def print_examples():
     """Print usage examples."""
@@ -571,6 +935,17 @@ Examples:
   python create_map_poster.py -c "London" -C "UK" -t noir -d 15000              # Thames curves
   python create_map_poster.py -c "Budapest" -C "Hungary" -t copper_patina -d 8000  # Danube split
   
+  # Address highlighting
+  python create_map_poster.py -c "Seattle" -C "USA" -t sunset \\
+    --address "300 E Pike St, Seattle, WA 98122" --annotation "Where our story began"
+  
+  python create_map_poster.py -c "New York" -C "USA" -t noir \\
+    --address "350 5th Ave, New York, NY 10118" --marker-style star
+  
+  python create_map_poster.py -c "Paris" -C "France" -t pastel_dream \\
+    --address "Champ de Mars, 5 Avenue Anatole France, 75007 Paris" \\
+    --annotation "Our favorite spot" --marker-style pin
+  
   # List themes
   python create_map_poster.py --list-themes
 
@@ -579,6 +954,9 @@ Options:
   --country, -C     Country name (required)
   --theme, -t       Theme name (default: feature_based)
   --distance, -d    Map radius in meters (default: 29000)
+  --address         Street address to highlight on the map
+  --annotation      Custom text to display below city name
+  --marker-style    Marker style: circle, pin, or star (default: circle)
   --list-themes     List all available themes
 
 Distance guide:
@@ -621,9 +999,23 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Basic usage
   python create_map_poster.py --city "New York" --country "USA"
   python create_map_poster.py --city Tokyo --country Japan --theme midnight_blue
   python create_map_poster.py --city Paris --country France --theme noir --distance 15000
+  
+  # Address highlighting
+  python create_map_poster.py --city Seattle --country "USA" --theme sunset \\
+    --address "300 E Pike St, Seattle, WA 98122" --annotation "Where our story began"
+  
+  python create_map_poster.py --city "New York" --country "USA" --theme noir \\
+    --address "350 5th Ave, New York, NY 10118" --marker-style star
+  
+  python create_map_poster.py --city Paris --country France --theme pastel_dream \\
+    --address "Champ de Mars, 5 Avenue Anatole France, 75007 Paris" \\
+    --annotation "Our favorite spot" --marker-style pin
+  
+  # List available themes
   python create_map_poster.py --list-themes
         """
     )
@@ -632,33 +1024,36 @@ Examples:
     parser.add_argument('--country', '-C', type=str, help='Country name')
     parser.add_argument('--theme', '-t', type=str, default='feature_based', help='Theme name (default: feature_based)')
     parser.add_argument('--distance', '-d', type=int, default=29000, help='Map radius in meters (default: 29000)')
+    parser.add_argument('--address', type=str, help='Street address to highlight on the map (e.g., "300 E Pike St, Seattle, WA 98122")')
+    parser.add_argument('--annotation', type=str, help='Custom text to display below city name (e.g., "Where our story began")')
+    parser.add_argument('--date', type=str, help='Date text to display (e.g., "June 15, 2019" or "Summer 2020")')
+    parser.add_argument('--marker-style', type=str, choices=['circle', 'pin', 'star', 'heart'], default='circle', help='Marker style for highlighted address (default: circle)')
     parser.add_argument('--list-themes', action='store_true', help='List all available themes')
-    parser.add_argument('--format', '-f', default='png', choices=['png', 'svg', 'pdf'],help='Output format for the poster (default: png)')
     
     args = parser.parse_args()
     
     # If no arguments provided, show examples
-    if len(sys.argv) == 1:
+    if len(os.sys.argv) == 1:
         print_examples()
-        sys.exit(0)
+        os.sys.exit(0)
     
     # List themes if requested
     if args.list_themes:
         list_themes()
-        sys.exit(0)
+        os.sys.exit(0)
     
     # Validate required arguments
     if not args.city or not args.country:
         print("Error: --city and --country are required.\n")
         print_examples()
-        sys.exit(1)
+        os.sys.exit(1)
     
     # Validate theme exists
     available_themes = get_available_themes()
     if args.theme not in available_themes:
         print(f"Error: Theme '{args.theme}' not found.")
         print(f"Available themes: {', '.join(available_themes)}")
-        sys.exit(1)
+        os.sys.exit(1)
     
     print("=" * 50)
     print("City Map Poster Generator")
@@ -670,15 +1065,61 @@ Examples:
     # Get coordinates and generate poster
     try:
         coords = get_coordinates(args.city, args.country)
-        output_file = generate_output_filename(args.city, args.theme, args.format)
-        create_poster(args.city, args.country, coords, args.distance, output_file, args.format)
+        
+        # Initialize address_highlight to None
+        address_highlight = None
+        
+        # Process address if provided (Subtask 9.1)
+        if args.address:
+            print("\n" + "=" * 50)
+            print("Processing address highlight...")
+            print("=" * 50)
+            
+            # Geocode the address
+            try:
+                address_coords = geocode_address(args.address, args.city, args.country)
+            except (GeocodingError, ConnectionError) as e:
+                print(f"\n✗ Geocoding failed: {e}")
+                os.sys.exit(1)
+            
+            # Use address coordinates as the map center for better framing
+            print(f"✓ Centering map on address location: {address_coords}")
+            coords = address_coords
+            
+            # Get marker colors from theme (Subtask 9.2)
+            fill_color, outline_color = get_marker_color(THEME)
+            print(f"✓ Marker colors: fill={fill_color}, outline={outline_color}")
+            
+            # Create AddressHighlight object
+            address_highlight = AddressHighlight(
+                address=args.address,
+                lat=address_coords[0],
+                lon=address_coords[1],
+                x=0.0,  # Will be calculated during rendering
+                y=0.0,  # Will be calculated during rendering
+                marker_style=args.marker_style,
+                fill_color=fill_color,
+                outline_color=outline_color,
+                annotation=args.annotation
+            )
+            print("✓ Address highlight configured")
+        
+        # Generate output filename with highlighted flag (Subtask 9.3)
+        output_file = generate_output_filename(args.city, args.theme, highlighted=(args.address is not None))
+        
+        # Create poster with address highlight
+        create_poster(args.city, args.country, coords, args.distance, output_file, 
+                     annotation=args.annotation, address_highlight=address_highlight, date_text=args.date)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")
         print("=" * 50)
         
+    except AddressOutOfBoundsError as e:
+        print(f"\n✗ Error: {e}")
+        os.sys.exit(1)
     except Exception as e:
         print(f"\n✗ Error: {e}")
         import traceback
         traceback.print_exc()
-        sys.exit(1)
+        os.sys.exit(1)
